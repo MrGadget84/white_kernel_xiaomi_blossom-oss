@@ -2,8 +2,8 @@
 VERSION = 4
 PATCHLEVEL = 19
 SUBLEVEL = 325
-EXTRAVERSION =
-NAME = "People's Front"
+EXTRAVERSION = -WKP-Blossom
+NAME = MrGadget84
 
 # *DOCUMENTATION*
 # To see a list of typical targets execute "make help"
