@@ -3921,6 +3921,7 @@ static int cgroup_add_file(struct cgroup_subsys_state *css, struct cgroup *cgrp,
 {
 	char name[CGROUP_FILE_NAME_MAX];
 	struct kernfs_node *kn;
+	struct kernfs_node *kn_link;
 	struct lock_class_key *key = NULL;
 	int ret;
 
@@ -3949,6 +3950,16 @@ static int cgroup_add_file(struct cgroup_subsys_state *css, struct cgroup *cgrp,
 		spin_lock_irq(&cgroup_file_kn_lock);
 		cfile->kn = kn;
 		spin_unlock_irq(&cgroup_file_kn_lock);
+	}
+
+	if (cft->ss && (cgrp->root->flags & CGRP_ROOT_NOPREFIX) &&
+	    !(cft->flags & CFTYPE_NO_PREFIX)) {
+		snprintf(name, CGROUP_FILE_NAME_MAX, "%s.%s",
+			 cgroup_on_dfl(cgrp) ? cft->ss->name :
+			 cft->ss->legacy_name, cft->name);
+		kn_link = kernfs_create_link(cgrp->kn, name, kn);
+		if (IS_ERR(kn_link))
+			return PTR_ERR(kn_link);
 	}
 
 	return 0;
