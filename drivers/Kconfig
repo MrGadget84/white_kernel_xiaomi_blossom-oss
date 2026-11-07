@@ -219,6 +219,8 @@ source "drivers/visorbus/Kconfig"
 
 source "drivers/siox/Kconfig"
 
+source "drivers/hdf/khdf/Kconfig"
+
 source "drivers/slimbus/Kconfig"
 
 source "drivers/interconnect/Kconfig"
