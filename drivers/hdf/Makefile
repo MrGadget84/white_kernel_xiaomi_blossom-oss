@@ -1,0 +1,1 @@
+obj-$(CONFIG_DRIVERS_HDF) += khdf/

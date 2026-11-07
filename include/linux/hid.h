@@ -625,6 +625,7 @@ struct hid_device {							/* device report descriptor */
 	struct list_head debug_list;
 	spinlock_t  debug_list_lock;
 	wait_queue_head_t debug_wait;
+	void *input_dev;
 	struct kref			ref;
 
 	unsigned int id;						/* system unique id */
