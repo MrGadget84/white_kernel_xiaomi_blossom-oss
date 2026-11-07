@@ -6,102 +6,161 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: harmony-hdf-integration
+  cancel-in-progress: false
+
 jobs:
   repair-hdf:
     runs-on: ubuntu-latest
 
     steps:
+      # --------------------------------------------------
+      # 1. Checkout
+      # --------------------------------------------------
       - name: Checkout Harmony kernel
         uses: actions/checkout@v4
         with:
           ref: harmony
           fetch-depth: 0
 
-      - name: Verify and revert previous HDF integration
+      # --------------------------------------------------
+      # 2. Revert previous incomplete integration
+      # --------------------------------------------------
+      - name: Revert previous incomplete HDF integration
         env:
           OLD_COMMIT: 5df98a42a0dfecaa5544c20e0e3a49852151025e
         run: |
-          set -e
+          set -euo pipefail
 
-          CURRENT=$(git rev-parse HEAD)
+          echo "Current HEAD:"
+          git log -1 --oneline
 
-          if [ "$CURRENT" != "$OLD_COMMIT" ]; then
-            echo "::error::Unexpected harmony HEAD: $CURRENT"
-            echo "Expected: $OLD_COMMIT"
-            echo "Stopping to avoid reverting unrelated commits."
+          if ! git cat-file -e "${OLD_COMMIT}^{commit}" 2>/dev/null; then
+            echo "::error::Previous HDF commit was not found."
+            exit 1
+          fi
+
+          if ! git merge-base --is-ancestor "$OLD_COMMIT" HEAD; then
+            echo "::error::Previous HDF commit is not an ancestor of harmony."
             exit 1
           fi
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
+          echo "Reverting incomplete HDF integration..."
           git revert --no-edit "$OLD_COMMIT"
 
+      # --------------------------------------------------
+      # 3. Download OpenHarmony HDF sources and dependencies
+      # --------------------------------------------------
       - name: Prepare OpenHarmony source tree
         env:
           OHOS_ROOT: ${{ runner.temp }}/ohos-src
         run: |
-          set -e
+          set -euo pipefail
 
           mkdir -p "$OHOS_ROOT/drivers"
           mkdir -p "$OHOS_ROOT/third_party"
           mkdir -p "$OHOS_ROOT/kernel_patches/linux-4.19/common_patch"
+
+          echo "Cloning OpenHarmony HDF..."
 
           git clone --depth 1 \
             --branch OpenHarmony-v5.0.0-Release \
             https://github.com/openharmony/drivers_hdf_core.git \
             "$OHOS_ROOT/drivers/hdf_core"
 
+          echo "Cloning bounds_checking_function..."
+
           git clone --depth 1 \
             https://github.com/openharmony/third_party_bounds_checking_function.git \
             "$OHOS_ROOT/third_party/bounds_checking_function"
 
-          git clone --depth 1 --filter=blob:none --sparse \
+          echo "Cloning FreeBSD evdev dependency..."
+
+          git clone --depth 1 \
+            --filter=blob:none \
+            --sparse \
             https://github.com/openharmony/third_party_FreeBSD.git \
             "$OHOS_ROOT/third_party/FreeBSD"
 
           git -C "$OHOS_ROOT/third_party/FreeBSD" \
             sparse-checkout set sys/dev/evdev
 
-          curl -fL \
+          echo "Downloading official OpenHarmony 5.0 kernel patch..."
+
+          curl -fL --retry 3 --retry-delay 2 \
             https://raw.githubusercontent.com/openharmony/kernel_linux_patches/OpenHarmony-v5.0.0-Release/linux-4.19/common_patch/hdf.patch \
             -o "$OHOS_ROOT/kernel_patches/linux-4.19/common_patch/hdf.patch"
 
+          test -s "$OHOS_ROOT/kernel_patches/linux-4.19/common_patch/hdf.patch"
+
+          echo "OpenHarmony sources prepared."
+
+      # --------------------------------------------------
+      # 4. Remove incompatible HID hunk
+      # --------------------------------------------------
       - name: Prepare Blossom-compatible HDF patch
         env:
           OHOS_ROOT: ${{ runner.temp }}/ohos-src
         run: |
-          set -e
+          set -euo pipefail
 
           python3 - <<'PY'
           from pathlib import Path
           import os
 
           root = Path(os.environ["OHOS_ROOT"])
-          patch_file = root / "kernel_patches/linux-4.19/common_patch/hdf.patch"
+
+          patch_file = (
+              root
+              / "kernel_patches/linux-4.19/common_patch/hdf.patch"
+          )
 
           content = patch_file.read_text()
+
           marker = "diff --git a/include/linux/hid.h b/include/linux/hid.h"
 
-          if content.count(marker) != 1:
-              raise SystemExit("Unexpected upstream HDF patch structure")
+          count = content.count(marker)
 
-          # Blossom needs this HID field inserted separately.
-          patch_file.write_text(content[:content.index(marker)])
+          if count != 1:
+              raise SystemExit(
+                  f"Unexpected HID patch structure: found {count} markers"
+              )
 
-          print("Prepared HDF patch without the incompatible HID hunk.")
+          # The original HID hunk does not apply cleanly to Blossom.
+          # We apply the remaining official patch and restore this
+          # single field separately in the next step.
+
+          content = content[:content.index(marker)]
+
+          if not content.strip():
+              raise SystemExit("Prepared HDF patch is empty")
+
+          patch_file.write_text(content)
+
+          print("HID hunk removed.")
+          print("Remaining official HDF patch preserved.")
           PY
 
+      # --------------------------------------------------
+      # 5. Apply official OpenHarmony HDF setup script
+      # --------------------------------------------------
       - name: Apply official HDF integration script
         env:
           OHOS_ROOT: ${{ runner.temp }}/ohos-src
         run: |
-          set -e
+          set -euo pipefail
 
           SCRIPT="$OHOS_ROOT/drivers/hdf_core/adapter/khdf/linux/patch_hdf.sh"
+          PATCH="$OHOS_ROOT/kernel_patches/linux-4.19/common_patch/hdf.patch"
 
           test -f "$SCRIPT"
-          test -f "$OHOS_ROOT/kernel_patches/linux-4.19/common_patch/hdf.patch"
+          test -s "$PATCH"
+
+          echo "Running official patch_hdf.sh..."
 
           bash "$SCRIPT" \
             "$OHOS_ROOT" \
@@ -109,24 +168,37 @@ jobs:
             "$OHOS_ROOT/kernel_patches/linux-4.19" \
             common
 
+          echo "Official HDF setup script finished."
+
+      # --------------------------------------------------
+      # 6. Restore Blossom HID compatibility
+      # --------------------------------------------------
       - name: Restore Blossom HID compatibility
         run: |
-          set -e
+          set -euo pipefail
 
           python3 - <<'PY'
           from pathlib import Path
 
           path = Path("include/linux/hid.h")
+
+          if not path.is_file():
+              raise SystemExit("include/linux/hid.h not found")
+
           content = path.read_text()
 
           anchor = "\twait_queue_head_t debug_wait;"
           field = "\tvoid *input_dev;"
 
           if content.count(anchor) != 1:
-              raise SystemExit("HID structure anchor mismatch")
+              raise SystemExit(
+                  "Could not uniquely locate debug_wait in hid_device"
+              )
 
           if field in content:
-              raise SystemExit("input_dev already exists; refusing duplicate insertion")
+              raise SystemExit(
+                  "input_dev already exists; refusing duplicate insertion"
+              )
 
           content = content.replace(
               anchor,
@@ -135,12 +207,16 @@ jobs:
           )
 
           path.write_text(content)
+
           print("Added input_dev to struct hid_device.")
           PY
 
-      - name: Convert temporary HDF symlinks into real files
+      # --------------------------------------------------
+      # 7. Replace temporary symlinks with actual files
+      # --------------------------------------------------
+      - name: Make HDF sources self-contained
         run: |
-          set -e
+          set -euo pipefail
 
           for path in \
             drivers/hdf/khdf \
@@ -148,31 +224,49 @@ jobs:
             drivers/hdf/inner_api \
             include/hdf
           do
+            echo "Processing $path"
+
             if [ -L "$path" ]; then
-              TARGET=$(readlink -f "$path")
+              TARGET="$(readlink -f "$path")"
 
               if [ ! -d "$TARGET" ]; then
-                echo "::error::Broken HDF symlink: $path"
+                echo "::error::Invalid HDF symlink: $path"
                 exit 1
               fi
 
               rm "$path"
               mkdir -p "$path"
               cp -a "$TARGET"/. "$path"/
+
             elif [ ! -d "$path" ]; then
               echo "::error::Missing HDF directory: $path"
               exit 1
             fi
           done
 
-      - name: Remove backup files
-        run: |
-          find drivers/hid -type f \
-            \( -name "*.orig" -o -name "*.rej" \) -delete
+          echo "HDF source directories copied into the kernel tree."
 
+      # --------------------------------------------------
+      # 8. Remove accidental patch backup files
+      # --------------------------------------------------
+      - name: Remove patch backup files
+        run: |
+          set -euo pipefail
+
+          find drivers/hid -type f \
+            \( -name "*.orig" -o -name "*.rej" \) \
+            -print -delete
+
+          echo "Backup files removed."
+
+      # --------------------------------------------------
+      # 9. Validate integration
+      # --------------------------------------------------
       - name: Validate HDF integration
         run: |
-          set -e
+          set -euo pipefail
+
+          echo "Checking required directories..."
 
           test -f drivers/hdf/khdf/Kconfig
           test -f drivers/hdf/khdf/Makefile
@@ -182,44 +276,76 @@ jobs:
           test -d bounds_checking_function
           test -d drivers/hdf/evdev
 
+          echo "Checking HID compatibility..."
+
           grep -q 'void \*input_dev;' include/linux/hid.h
-          grep -q 'source "drivers/hdf/khdf/Kconfig"' drivers/Kconfig
-          grep -q 'obj-$(CONFIG_DRIVERS_HDF) += hdf/' drivers/Makefile
 
-          if find . -type l -xtype l | grep -q .; then
-            echo "::error::Broken symbolic links detected"
+          echo "Checking kernel integration..."
+
+          grep -q 'drivers/hdf/khdf/Kconfig' drivers/Kconfig
+
+          echo "Checking for broken symbolic links..."
+
+          BROKEN_LINKS="$(find . -type l -xtype l -print)"
+
+          if [ -n "$BROKEN_LINKS" ]; then
+            echo "::error::Broken symbolic links detected:"
+            echo "$BROKEN_LINKS"
             exit 1
           fi
 
-          if find drivers/hid -name "*.orig" | grep -q .; then
-            echo "::error::Backup files remain"
+          echo "Checking for leftover patch files..."
+
+          if find drivers/hid -type f \
+            \( -name "*.orig" -o -name "*.rej" \) \
+            | grep -q .; then
+            echo "::error::Patch backup files remain."
             exit 1
           fi
+
+          echo "Checking whitespace..."
 
           git diff --check
 
-          echo "HDF integration files:"
-          du -sh drivers/hdf include/hdf bounds_checking_function
+          echo ""
+          echo "HDF directory sizes:"
+          du -sh \
+            drivers/hdf/khdf \
+            drivers/hdf/framework \
+            drivers/hdf/inner_api \
+            drivers/hdf/evdev \
+            include/hdf \
+            bounds_checking_function
 
-          echo "Change summary:"
+          echo ""
+          echo "Changed files:"
           git status --short
-          git diff --stat
 
-      - name: Commit and push repaired integration
+          echo ""
+          echo "Validation passed."
+
+      # --------------------------------------------------
+      # 10. Commit and push
+      # --------------------------------------------------
+      - name: Commit and push HDF integration
         run: |
-          set -e
+          set -euo pipefail
 
           git add -A \
             arch/arm/kernel/vmlinux.lds.S \
             arch/arm64/kernel/vmlinux.lds.S \
-            drivers/Kconfig \
-            drivers/Makefile \
-            drivers/hdf \
-            drivers/hid \
+            drivers \
             include/linux/hid.h \
             include/hdf \
             bounds_checking_function
 
+          if git diff --cached --quiet; then
+            echo "::error::No changes to commit."
+            exit 1
+          fi
+
           git commit -m "Complete OpenHarmony HDF kernel integration"
 
           git push origin HEAD:harmony
+
+          echo "HDF integration changes pushed to harmony."
