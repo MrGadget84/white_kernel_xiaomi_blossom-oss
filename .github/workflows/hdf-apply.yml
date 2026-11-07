@@ -1,0 +1,85 @@
+name: Apply OpenHarmony HDF Patch
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apply-hdf:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Harmony kernel
+        uses: actions/checkout@v4
+        with:
+          ref: harmony
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Download HDF patch
+        run: |
+          curl -fL \
+            https://raw.githubusercontent.com/openharmony/kernel_linux_patches/OpenHarmony-v5.0.0-Release/linux-4.19/common_patch/hdf.patch \
+            -o hdf.patch
+
+      - name: Remove conflicting upstream HID hunk
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("hdf.patch")
+          content = path.read_text()
+          marker = "diff --git a/include/linux/hid.h b/include/linux/hid.h"
+
+          if content.count(marker) != 1:
+              raise SystemExit("Unexpected HID patch structure")
+
+          path.write_text(content[:content.index(marker)])
+          PY
+
+      - name: Apply HDF patch
+        run: |
+          patch --batch --forward -p1 < hdf.patch
+
+      - name: Adapt Blossom HID structure
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("include/linux/hid.h")
+          text = path.read_text()
+
+          anchor = "\twait_queue_head_t debug_wait;"
+
+          if text.count(anchor) != 1:
+              raise SystemExit("HID structure anchor mismatch")
+
+          text = text.replace(
+              anchor,
+              anchor + "\n\tvoid *input_dev;",
+              1
+          )
+
+          path.write_text(text)
+          PY
+
+      - name: Validate changes
+        run: |
+          git diff --check
+          git status --short
+          git diff --stat
+
+      - name: Commit HDF integration
+        run: |
+          git add drivers/Kconfig drivers/Makefile \
+            drivers/hdf drivers/hid include/linux/hid.h \
+            arch/arm64/kernel/vmlinux.lds.S \
+            arch/arm/kernel/vmlinux.lds.S
+
+          git commit -m "Add OpenHarmony HDF kernel integration"
+          git push origin HEAD:harmony
